@@ -240,38 +240,101 @@ async def handle_output_limit_error(messages, llm, max_output_tokens=8192):
 When streaming fails mid-turn, stale partial state must be cleaned up before retrying non-streaming. Skipping this step causes orphan `tool_results` with stale IDs that poison the fallback response.
 
 ```python
-from dataclasses import dataclass
-from typing import Optional
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, AsyncIterator
 
 @dataclass
 class StreamingState:
-    partial_messages: list = None
-    pending_tool_results: list = None
+    partial_messages: list = field(default_factory=list)
+    pending_tool_results: list = field(default_factory=list)
     executor: object = None
 
     def tombstone_and_reset(self) -> "StreamingState":
         """
         Mark all partial messages as abandoned, discard pending tool results.
         Call this before falling back to non-streaming retry.
-        """
-        # Mark partial assistant messages as tombstoned
-        # (prevents 'thinking blocks cannot be modified' API error)
-        for msg in (self.partial_messages or []):
-            msg.metadata = {**(msg.metadata or {}), "tombstoned": True}
 
-        # Discard pending tool results (they have IDs tied to the failed stream)
-        # Return a clean slate
+        Why: Streaming may produce a partial AIMessage with a tool_call_id before
+        failing. If that partial message stays in state, the non-streaming retry
+        sees an AIMessage (tool call) with no matching ToolMessage — the API rejects
+        this as 'thinking blocks cannot be modified'.
+        """
+        for msg in (self.partial_messages or []):
+            # Tombstone: mark as abandoned so downstream nodes skip them
+            if hasattr(msg, "metadata"):
+                msg.metadata = {**(msg.metadata or {}), "tombstoned": True, "abandoned": True}
+
+        # Discard pending tool results — their IDs are tied to the failed stream
         return StreamingState(
             partial_messages=[],
             pending_tool_results=[],
             executor=None
         )
 
-def retry_with_non_streaming(messages: list, llm, streaming_state: StreamingState):
-    """Fallback from streaming to non-streaming after a stream error."""
-    clean_state = streaming_state.tombstone_and_reset()
-    # Now safe to retry: no orphan tool_results, no partial assistant messages
-    return llm.invoke(messages)
+
+async def stream_with_fallback(
+    messages: list,
+    llm,
+    on_chunk=None,
+) -> str:
+    """
+    Attempt streaming; fall back to non-streaming on any mid-stream error.
+    Cleans up orphan state before retrying.
+
+    Args:
+        messages: Message history to send to LLM.
+        llm: LLM instance supporting both `.astream()` and `.ainvoke()`.
+        on_chunk: Optional callback receiving each streamed string chunk.
+
+    Returns:
+        Final complete response content string.
+    """
+    streaming_state = StreamingState()
+    collected_chunks = []
+
+    try:
+        async for chunk in llm.astream(messages):
+            content = chunk.content if hasattr(chunk, "content") else str(chunk)
+            collected_chunks.append(content)
+            streaming_state.partial_messages.append(chunk)
+            if on_chunk:
+                on_chunk(content)
+        return "".join(collected_chunks)
+
+    except Exception as stream_error:
+        logging.warning(
+            f"Streaming failed after {len(collected_chunks)} chunks: "
+            f"{type(stream_error).__name__}: {stream_error}. "
+            "Falling back to non-streaming."
+        )
+        # Step 1: Tombstone and clean up all partial state
+        streaming_state = streaming_state.tombstone_and_reset()
+
+        # Step 2: Retry non-streaming with original messages (no partial state)
+        # Safe because tombstone_and_reset() removed all orphan messages
+        try:
+            response = await llm.ainvoke(messages)
+            return response.content
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"Both streaming and non-streaming failed. "
+                f"Stream error: {stream_error}. "
+                f"Fallback error: {fallback_error}"
+            ) from fallback_error
+
+
+# Usage in a LangGraph node:
+async def agent_node_with_streaming(state: dict) -> dict:
+    from langchain_core.messages import AIMessage
+
+    content = await stream_with_fallback(
+        messages=state["messages"],
+        llm=llm,
+        on_chunk=lambda c: print(c, end="", flush=True)  # optional: print as it streams
+    )
+    return {**state, "messages": state["messages"] + [AIMessage(content=content)]}
 ```
 
 ## Unattended Retry with Heartbeats

@@ -82,16 +82,33 @@ The examples are primarily LangGraph-oriented, but the design guidance is framew
 agent-guru/
 ├── README.md
 ├── SKILL.md
+├── examples/
+│   ├── README.md
+│   ├── simple_react_agent/
+│   │   └── agent.py          ← minimal runnable single-agent example
+│   └── multi_agent_router/
+│       └── agent.py          ← router + specialist agents example
 └── references/
     ├── memory-layer.md
     ├── observability-layer.md
+    ├── operations-layer.md   ← NEW: versioning, runbooks, multi-tenancy, alerts
     ├── orchestrator-layer.md
     ├── persistence-layer.md
     ├── production-checklist.md
     ├── resilience-layer.md
     ├── router-layer.md
+    ├── testing-layer.md      ← NEW: agent testing, fault injection, replay tests
     └── tool-safety-layer.md
 ```
+
+## Examples
+
+The `examples/` directory contains minimal, runnable implementations of the core patterns:
+
+- **`simple_react_agent/`** — Single ReAct agent with permission guards, telemetry, and iteration limits
+- **`multi_agent_router/`** — Intent router dispatching to specialist agents with adversarial defense
+
+See [`examples/README.md`](./examples/README.md) for install instructions and usage.
 
 ## How To Read This Skill
 
@@ -107,7 +124,9 @@ Suggested reading order:
 6. `observability-layer.md`
 7. `resilience-layer.md`
 8. `persistence-layer.md`
-9. `production-checklist.md`
+9. `testing-layer.md`
+10. `operations-layer.md`
+11. `production-checklist.md`
 
 ## Status
 

@@ -313,6 +313,126 @@ async def execute_tools_concurrently(tool_calls, query_abort: AbortController):
     return await asyncio.gather(*[run_one(tc) for tc in tool_calls], return_exceptions=True)
 ```
 
+## Async GuardedToolNode
+
+The synchronous `GuardedToolNode` blocks the event loop when used in async contexts (e.g., FastAPI, async LangGraph pipelines). Use `AsyncGuardedToolNode` for async agent graphs.
+
+```python
+import asyncio
+from langchain_core.messages import ToolMessage
+
+class AsyncGuardedToolNode(GuardedToolNode):
+    """
+    Async variant of GuardedToolNode.
+    Use when your agent graph runs with `app.ainvoke()` or inside an async framework.
+    Identical permission logic — async __call__ only.
+    """
+    async def __call__(self, state):
+        tool_calls = state["messages"][-1].tool_calls
+        for tc in tool_calls:
+            mode, reason = self._check_permission(tc["name"], tc["args"])
+
+            self.audit_log.append({
+                "tool": tc["name"], "args": tc["args"],
+                "decision": mode.value, "reason": reason,
+                "timestamp": __import__("datetime").datetime.utcnow().isoformat()
+            })
+
+            if mode == PermissionMode.ALWAYS_DENY:
+                return {"messages": [ToolMessage(
+                    content=f"DENIED: {reason}", tool_call_id=tc["id"]
+                )]}
+
+            if mode == PermissionMode.ASK:
+                # interrupt() is framework-level — same as sync variant
+                human_decision = interrupt({
+                    "type": "tool_approval_request",
+                    "tool": tc["name"], "args": tc["args"], "reason": reason,
+                    "message": f"Agent wants to call `{tc['name']}`. Approve? (yes/no)"
+                })
+                if str(human_decision).lower() != "yes":
+                    return {"messages": [ToolMessage(
+                        content="User denied this tool call.", tool_call_id=tc["id"]
+                    )]}
+
+        # Delegate to async ToolNode execution
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: super(AsyncGuardedToolNode, self).__call__(state)
+        )
+
+
+# Usage — compile graph with async node
+async_guarded_tools = AsyncGuardedToolNode(tools=your_tools, rules=DEVOPS_RULES)
+graph = StateGraph(AgentState)
+graph.add_node("tools", async_guarded_tools)
+app = graph.compile(checkpointer=checkpointer)
+
+# Invoke asynchronously
+result = await app.ainvoke({"messages": [...]}, config=config)
+```
+
+## Multi-Tenant Tool Isolation
+
+In multi-tenant deployments, each tenant needs independently scoped permission rules, tool quotas, and audit logs. Never share mutable state across tenants.
+
+```python
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+@dataclass
+class TenantToolPolicy:
+    tenant_id: str
+    rules: list          # list[PermissionRule] — tenant-specific overrides
+    max_tool_calls_per_session: int = 200
+    allowed_tool_names: list = field(default_factory=list)  # empty = all allowed
+
+class TenantGuardedToolNode(GuardedToolNode):
+    """
+    GuardedToolNode variant that loads per-tenant rules and enforces quotas.
+    """
+    def __init__(self, tools, tenant_policies: dict[str, TenantToolPolicy],
+                 default_rules: list, audit_log=None):
+        super().__init__(tools, default_rules, audit_log)
+        self.tenant_policies = tenant_policies
+        self._call_counts: dict = defaultdict(int)   # tenant_id → call count
+
+    def _get_rules_for_tenant(self, tenant_id: str) -> list:
+        policy = self.tenant_policies.get(tenant_id)
+        if policy and policy.rules:
+            return policy.rules  # tenant-specific rules take precedence
+        return self.rules        # fall back to default rules
+
+    def __call__(self, state):
+        tenant_id = state.get("tenant_id", "default")
+        policy = self.tenant_policies.get(tenant_id)
+
+        tool_calls = state["messages"][-1].tool_calls
+
+        # Enforce per-tenant tool call quota
+        if policy:
+            self._call_counts[tenant_id] += len(tool_calls)
+            if self._call_counts[tenant_id] > policy.max_tool_calls_per_session:
+                return {"messages": [ToolMessage(
+                    content=f"Tool quota exceeded for tenant {tenant_id}.",
+                    tool_call_id=tool_calls[0]["id"]
+                )]}
+            # Enforce allowed tool list
+            if policy.allowed_tool_names:
+                for tc in tool_calls:
+                    if tc["name"] not in policy.allowed_tool_names:
+                        return {"messages": [ToolMessage(
+                            content=f"Tool `{tc['name']}` not permitted for your account.",
+                            tool_call_id=tc["id"]
+                        )]}
+
+        # Use tenant-specific rules for permission check
+        original_rules = self.rules
+        self.rules = self._get_rules_for_tenant(tenant_id)
+        result = super().__call__(state)
+        self.rules = original_rules   # restore
+        return result
+```
+
 ## Common Mistakes
 
 | Mistake | Fix |
@@ -324,3 +444,5 @@ async def execute_tools_concurrently(tool_calls, query_abort: AbortController):
 | No killswitch for dangerous modes | Add remote config fetch with fail-safe: restrict on fetch error |
 | Concurrency check only in schema | Inspect actual inputs at call time — schema can't see bash command content |
 | One abort for everything | Two-level hierarchy: query-abort (user cancel) + sibling-abort (peer failure) |
+| Using sync `GuardedToolNode` in async graph | Use `AsyncGuardedToolNode` — sync variant blocks the event loop |
+| Shared audit log across tenants | Each tenant needs an isolated audit log; shared state is a compliance risk |
