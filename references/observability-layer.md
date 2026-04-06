@@ -19,6 +19,34 @@ Agents fail in ways that are fundamentally different from traditional software: 
 
 An agent silently calls a paid search API 200 times across a session. Without per-turn token + tool tracking, you only discover the $40 bill at end of month. With `AgentTelemetry`, you catch it at call #5 and trigger a budget alert.
 
+## Dynamic Model Pricing
+
+Hardcoded pricing rates go stale when providers update their models. Load rates from environment or config so you can update without redeploying.
+
+```python
+import json
+import os
+
+# Set this env var with current rates as JSON, e.g.:
+# MODEL_PRICING_JSON='{"claude-sonnet-4-6": {"input": 0.000015, "output": 0.000075, "cache": 0.0000015}}'
+_MODEL_PRICING: dict = json.loads(os.getenv("MODEL_PRICING_JSON", "{}"))
+
+_DEFAULT_RATES = {
+    "input":  0.000015,   # $ per input token
+    "output": 0.000075,   # $ per output token
+    "cache":  0.0000015,  # $ per cache-read token
+}
+
+def get_model_rates(model_id: str) -> dict:
+    """Return pricing rates for a given model ID, falling back to defaults."""
+    return _MODEL_PRICING.get(model_id, _DEFAULT_RATES)
+```
+
+**How to update pricing:**
+1. Update `MODEL_PRICING_JSON` in your deployment's environment variables
+2. Restart the service (or hot-reload if your config system supports it)
+3. No code deploy needed
+
 ## Structured Telemetry Callback
 
 ```python
@@ -34,10 +62,11 @@ class AgentTelemetry(BaseCallbackHandler):
     Full execution trace for debugging, cost tracking, and replay.
     Plug into any observability backend (Langfuse, Datadog, CloudWatch, etc.)
     """
-    def __init__(self, session_id: str = None, sink=None):
+    def __init__(self, session_id: str = None, sink=None, model_id: str = None):
         self.session_id = session_id or str(uuid.uuid4())
         self.sink = sink or (lambda e: print(json.dumps(e)))
         self.span_stack = []
+        self._model_id = model_id or os.getenv("AGENT_MODEL_ID", "")
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         self.span_stack.append({
@@ -77,10 +106,10 @@ class AgentTelemetry(BaseCallbackHandler):
         self.sink({**span, "error": str(error), "status": "failed"})
 
     def _estimate_cost(self, usage: dict) -> float:
-        # Adjust rates to match your model's pricing
-        input_cost  = usage.get("input_tokens",  0) * 0.000015
-        output_cost = usage.get("output_tokens", 0) * 0.000075
-        cache_cost  = usage.get("cache_read_input_tokens", 0) * 0.0000015
+        rates = get_model_rates(self._model_id)
+        input_cost  = usage.get("input_tokens",  0) * rates["input"]
+        output_cost = usage.get("output_tokens", 0) * rates["output"]
+        cache_cost  = usage.get("cache_read_input_tokens", 0) * rates["cache"]
         return round(input_cost + output_cost + cache_cost, 6)
 
 
@@ -107,8 +136,10 @@ class SessionCostTracker:
     total_cost_usd: float = 0.0
 
     def record_turn(self, agent_name: str, input_tokens: int,
-                    output_tokens: int, tools_called: list):
-        cost = (input_tokens * 0.000015) + (output_tokens * 0.000075)
+                    output_tokens: int, tools_called: list,
+                    model_id: str = ""):
+        rates = get_model_rates(model_id)
+        cost = (input_tokens * rates["input"]) + (output_tokens * rates["output"])
         self.total_cost_usd += cost
         self.cost_by_agent[agent_name] += cost
         self.tokens_by_turn.append({"input": input_tokens, "output": output_tokens})
@@ -225,6 +256,42 @@ class TurnAnalytics:
             })
 ```
 
+## Observability Backend Integration
+
+`AgentTelemetry` emits structured events. Plug the `sink` parameter into your observability platform of choice. The callback itself is platform-agnostic.
+
+| Platform | Integration approach |
+|----------|---------------------|
+| **Langfuse** | Use `langfuse.get_client().trace()` as sink; or use the official `CallbackHandler` from `langfuse.langchain` |
+| **Datadog** | Post events to Datadog Logs API via `datadog_api_client`; use `dd_trace` for distributed tracing |
+| **AWS CloudWatch** | Use `boto3.client("logs").put_log_events()` as sink; group by `session_id` as log stream |
+| **OpenTelemetry** | Emit spans via `opentelemetry-sdk`; use `trace.get_tracer(__name__)` and set span attributes from event dict |
+
+```python
+# Example: Langfuse sink
+from langfuse import Langfuse
+
+langfuse = Langfuse()
+
+def langfuse_sink(event: dict):
+    if event.get("type") == "llm_call":
+        langfuse.generation(
+            name="llm_turn",
+            session_id=event["session_id"],
+            usage={"input": event.get("input_tokens", 0),
+                   "output": event.get("output_tokens", 0)},
+            metadata=event
+        )
+    elif event.get("type") == "tool_call":
+        langfuse.span(
+            name=event.get("tool_name", "tool"),
+            session_id=event["session_id"],
+            metadata=event
+        )
+
+telemetry = AgentTelemetry(session_id="session-abc", sink=langfuse_sink)
+```
+
 ## Common Mistakes
 
 | Mistake | Fix |
@@ -236,3 +303,4 @@ class TurnAnalytics:
 | Separate traces per subagent | Propagate parent callbacks to all subagents — single root trace |
 | Re-reading feature flags mid-turn | Snapshot all config at query entry — changes mid-turn cause inconsistency |
 | No continuation analytics | Track token deltas per continuation to detect diminishing returns early |
+| Hardcoded model pricing | Load rates from `MODEL_PRICING_JSON` env var — provider pricing changes frequently |

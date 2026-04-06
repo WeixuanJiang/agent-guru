@@ -74,13 +74,15 @@ Load these **on demand** using the triggers listed below. Do not load all of the
 
 | File | Load when... |
 |------|-------------|
-| [references/router-layer.md](references/router-layer.md) | Designing intent routing, building a classifier node, handling misrouting |
+| [references/router-layer.md](references/router-layer.md) | Designing intent routing, building a classifier node, handling misrouting, multi-intent inputs |
 | [references/orchestrator-layer.md](references/orchestrator-layer.md) | Decomposing tasks, spawning subagents, implementing plan-then-execute |
-| [references/tool-safety-layer.md](references/tool-safety-layer.md) | Designing tools, adding permission rules, implementing HITL or killswitch |
+| [references/tool-safety-layer.md](references/tool-safety-layer.md) | Designing tools, adding permission rules, implementing HITL, killswitch, async tools, multi-tenant isolation |
 | [references/memory-layer.md](references/memory-layer.md) | Context window approaching limit, adding long-term memory, injecting project context |
-| [references/observability-layer.md](references/observability-layer.md) | Adding tracing, tracking token cost, debugging agent behavior, setting up alerts |
-| [references/resilience-layer.md](references/resilience-layer.md) | Adding retry logic, circuit breakers, preventing infinite loops |
+| [references/observability-layer.md](references/observability-layer.md) | Adding tracing, tracking token cost, debugging agent behavior, setting up alerts, integrating Langfuse/Datadog |
+| [references/resilience-layer.md](references/resilience-layer.md) | Adding retry logic, circuit breakers, preventing infinite loops, streaming fallback |
 | [references/persistence-layer.md](references/persistence-layer.md) | Choosing a checkpointer, implementing session resume, session branching |
+| [references/testing-layer.md](references/testing-layer.md) | Writing agent tests, mocking LLMs, fault injection, replay testing, permission rule unit tests |
+| [references/operations-layer.md](references/operations-layer.md) | Model versioning, per-tenant rate limits, alert escalation, runbooks, blue-green deploys |
 | [references/production-checklist.md](references/production-checklist.md) | Before deploying to production — full ~40-point readiness checklist |
 
 ## Quick Reference
@@ -88,25 +90,40 @@ Load these **on demand** using the triggers listed below. Do not load all of the
 | Pattern | Key implementation | Reference |
 |---------|--------------------|-----------|
 | Intent routing | `conditional_edges` + confidence threshold | `router-layer.md` |
+| Multi-intent routing | `intents: list[Literal[...]]` → orchestrator | `router-layer.md` |
+| Adversarial defense | Sanitize + injection pattern check before classify | `router-layer.md` |
+| Clarification flow | Max `MAX_CLARIFICATION_ROUNDS`, then graceful reject | `router-layer.md` |
 | Scoped subagents | `create_react_agent` with tool subset | `orchestrator-layer.md` |
 | Plan-then-execute | Two nodes, read-only tools in plan phase | `orchestrator-layer.md` |
 | Tool schema | `args_schema=PydanticModel` on `@tool` | `tool-safety-layer.md` |
 | Permission guard | `GuardedToolNode` with `PermissionRule` list | `tool-safety-layer.md` |
+| Async permission guard | `AsyncGuardedToolNode` for async graphs | `tool-safety-layer.md` |
 | HITL interrupt | `interrupt()` + `Command(resume=...)` | `tool-safety-layer.md` |
 | Runtime concurrency | `is_concurrency_safe(input)` per tool call | `tool-safety-layer.md` |
 | Abort hierarchy | Query-level abort + sibling-level child abort | `tool-safety-layer.md` |
+| Multi-tenant isolation | `TenantGuardedToolNode` + per-tenant quota | `tool-safety-layer.md` |
 | Tiered compaction | budget → snip → microcompact → autocompact | `memory-layer.md` |
 | Auto-compaction | Summarization node at 80% context | `memory-layer.md` |
 | Context injection | `AGENT.md` loaded into system prompt | `memory-layer.md` |
 | Full trace | `BaseCallbackHandler` + structured events | `observability-layer.md` |
 | Cost tracking | Per-turn token accounting in callback | `observability-layer.md` |
+| Dynamic pricing | `MODEL_PRICING_JSON` env var + `get_model_rates()` | `observability-layer.md` |
 | Config snapshot | Freeze all feature flags at query entry | `observability-layer.md` |
+| Observability backend | Plug `sink` into Langfuse / Datadog / CloudWatch | `observability-layer.md` |
 | Diminishing returns | Track token deltas; stop if delta < 500 × 2 | `resilience-layer.md` |
 | Output limit escalation | Escalate to 64k tokens before compaction | `resilience-layer.md` |
-| Streaming cleanup | Tombstone partial messages on fallback | `resilience-layer.md` |
+| Streaming cleanup | `stream_with_fallback` + tombstone on error | `resilience-layer.md` |
 | Error-as-observation | `try/except` → `ToolMessage` | `resilience-layer.md` |
 | Circuit breaker | State machine wrapping tool fn | `resilience-layer.md` |
 | Session resume | Checkpointer + stable `thread_id` | `persistence-layer.md` |
+| Agent unit test | Mock LLM + assert `ToolMessage` returned | `testing-layer.md` |
+| Permission rule test | `_check_permission` tested in isolation | `testing-layer.md` |
+| Fault injection | `FlakyTool` + `pytest-asyncio` retry tests | `testing-layer.md` |
+| Replay test | Record trace fixture; replay on CI | `testing-layer.md` |
+| Model versioning | Pin `AGENT_MODEL_ID`; blue-green via env var | `operations-layer.md` |
+| Per-tenant limits | `TenantPolicy` + `TenantRateLimiter` | `operations-layer.md` |
+| Alert escalation | `fire_alert()` with severity matrix | `operations-layer.md` |
+| Runbooks | Agent stuck / cost explosion / tool failure | `operations-layer.md` |
 
 ## Gotchas
 
@@ -120,3 +137,6 @@ Load these **on demand** using the triggers listed below. Do not load all of the
 - **Track diminishing returns, not just token budget.** An agent can burn through its iteration budget producing nearly empty continuations. Stop when the last 2 deltas are both below ~500 tokens.
 - **Snapshot config at query entry.** Never re-read feature flags or env vars mid-turn — a remote config change during a 30-second response causes inconsistent behavior within a single turn.
 - **Concurrency safety must be checked at runtime.** Schema metadata cannot determine if a bash command is safe — inspect the actual input string at call time. Fail conservatively (serial) if parsing fails.
+- **Hardcoded model pricing goes stale.** Provider rates change. Use `MODEL_PRICING_JSON` env var and `get_model_rates()` — update pricing without redeployment.
+- **Sync `GuardedToolNode` blocks the event loop in async graphs.** Use `AsyncGuardedToolNode` when your graph runs with `app.ainvoke()` or inside FastAPI.
+- **Multi-intent inputs routed to a single specialist produce partial answers.** Detect multiple intents with `list[Literal[...]]` output; route to the orchestrator for decomposition.
